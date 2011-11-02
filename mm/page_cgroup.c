@@ -109,6 +109,7 @@ static void *__meminit alloc_page_cgroup(size_t size, int nid)
 {
 	gfp_t flags = GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN;
 	void *addr = NULL;
+	gfp_t flags = GFP_KERNEL | __GFP_NOWARN;
 
 	addr = alloc_pages_exact_nid(nid, size, flags);
 	if (addr) {
