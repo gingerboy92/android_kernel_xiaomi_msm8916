@@ -811,6 +811,7 @@ void __init setup_arch(char **cmdline_p)
 	if (is_smp()) {
 		smp_set_ops(mdesc->smp);
 		smp_init_cpus();
+		arm_dt_init_cpu_maps();
 	}
 #endif
 	arm_dt_init_cpu_maps();
