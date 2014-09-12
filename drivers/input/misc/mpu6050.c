@@ -61,7 +61,7 @@
 
 #define MPU6050_RESET_SLEEP_US	10
 
-#define MPU6050_DEV_NAME_ACCEL	"accelerometer"
+#define MPU6050_DEV_NAME_ACCEL	"MPU6050-accel"
 #define MPU6050_DEV_NAME_GYRO	"gyroscope"
 
 #define MPU6050_PINCTRL_DEFAULT	"mpu_default"
