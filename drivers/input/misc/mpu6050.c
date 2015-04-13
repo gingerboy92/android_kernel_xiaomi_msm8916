@@ -104,8 +104,8 @@ struct axis_data {
  *  @accel_cdev:		sensor class device structure for accelerometer.
  *  @gyro_cdev:		sensor class device structure for gyroscope.
  *  @pdata:	device platform dependent data.
- *  @accel_poll_work:	accelerometer delay work structure
- *  @gyro_poll_work:	gyroscope delay work structure.
+ *  @accel_poll_work:	accelerometer work structure
+ *  @gyro_poll_work:	gyroscope work structure.
  *  @vlogic:	regulator data for Vlogic and I2C bus pullup.
  *  @vdd:		regulator data for Vdd.
  *  @reg:		notable slave registers.
@@ -126,8 +126,10 @@ struct mpu6050_sensor {
 	struct mpu6050_platform_data *pdata;
 	struct mutex op_lock;
 	enum inv_devices chip_type;
-	struct delayed_work accel_poll_work;
-	struct delayed_work gyro_poll_work;
+	struct work_struct accel_poll_work;
+	struct hrtimer timer_acc;
+	struct work_struct gyro_poll_work;
+	struct hrtimer timer_gyro;
 	struct mpu_reg_map reg;
 	struct mpu_chip_config cfg;
 	struct axis_data axis;
@@ -616,9 +618,8 @@ static void mpu6050_accel_work_fn(struct work_struct *work)
 	struct mpu6050_sensor *sensor;
 	u32 shift;
 	ktime_t timestamp;
-
-	sensor = container_of((struct delayed_work *)work,
-				struct mpu6050_sensor, accel_poll_work);
+	sensor = container_of(work, struct mpu6050_sensor,
+				 accel_poll_work);
 
 	timestamp = ktime_get();
 	mpu6050_read_accel_data(sensor, &sensor->axis);
@@ -639,9 +640,28 @@ static void mpu6050_accel_work_fn(struct work_struct *work)
 		ktime_to_timespec(timestamp).tv_nsec);
 	input_sync(sensor->accel_dev);
 
-	if (sensor->use_poll)
-		schedule_delayed_work(&sensor->accel_poll_work,
-			msecs_to_jiffies(sensor->accel_poll_ms));
+}
+
+/**
+ * mpu6050_acc_timer_handle() - timer_acc handle to schedule workerthread
+ * @hrtimer: the hrtimer struct
+ *
+ * handle gets called based on the poll time to schedule worker thread
+ */
+static enum hrtimer_restart mpu6050_acc_timer_handle(struct hrtimer *hrtimer)
+{
+	ktime_t ktime;
+	struct mpu6050_sensor *sensor;
+	sensor = container_of(hrtimer, struct mpu6050_sensor, timer_acc);
+
+	ktime = ktime_get();
+	schedule_work(&sensor->accel_poll_work);
+
+	ktime = ktime_set(0,
+                        sensor->accel_poll_ms * NSEC_PER_MSEC);
+	hrtimer_start(&sensor->timer_acc, ktime, HRTIMER_MODE_REL);
+
+       return HRTIMER_NORESTART;
 }
 
 /**
@@ -657,7 +677,7 @@ static void mpu6050_gyro_work_fn(struct work_struct *work)
 	u32 shift;
 	ktime_t timestamp;
 
-	sensor = container_of((struct delayed_work *)work,
+	sensor = container_of(work,
 				struct mpu6050_sensor, gyro_poll_work);
 
 	timestamp = ktime_get();
@@ -679,9 +699,28 @@ static void mpu6050_gyro_work_fn(struct work_struct *work)
 		ktime_to_timespec(timestamp).tv_nsec);
 	input_sync(sensor->gyro_dev);
 
-	if (sensor->use_poll)
-		schedule_delayed_work(&sensor->gyro_poll_work,
-			msecs_to_jiffies(sensor->gyro_poll_ms));
+}
+
+/**
+ * mpu6050_gyro_timer_handle() - timer_gyro handle to schedule workerthread
+ * @hrtimer: the hrtimer struct
+ *
+ * handle gets called based on the poll time to schedule worker thread
+ */
+static enum hrtimer_restart mpu6050_gyro_timer_handle(struct hrtimer *hrtimer)
+{
+	ktime_t ktime;
+	struct mpu6050_sensor *sensor;
+	sensor = container_of(hrtimer, struct mpu6050_sensor, timer_gyro);
+
+	ktime = ktime_get();
+	schedule_work(&sensor->gyro_poll_work);
+
+	ktime = ktime_set(0,
+                        sensor->gyro_poll_ms * NSEC_PER_MSEC);
+	hrtimer_start(&sensor->timer_gyro, ktime, HRTIMER_MODE_REL);
+
+       return HRTIMER_NORESTART;
 }
 
 /**
@@ -1072,6 +1111,7 @@ exit:
 static int mpu6050_gyro_set_enable(struct mpu6050_sensor *sensor, bool enable)
 {
 	int ret = 0;
+	ktime_t ktime;
 
 	mutex_lock(&sensor->op_lock);
 	if (enable) {
@@ -1099,8 +1139,9 @@ static int mpu6050_gyro_set_enable(struct mpu6050_sensor *sensor, bool enable)
 		}
 
 		if (sensor->use_poll)
-			schedule_delayed_work(&sensor->gyro_poll_work,
-				msecs_to_jiffies(sensor->gyro_poll_ms));
+			ktime = ktime_set(0,
+					sensor->gyro_poll_ms * NSEC_PER_MSEC);
+			hrtimer_start(&sensor->timer_gyro, ktime, HRTIMER_MODE_REL);
 	} else {
 		ret = mpu6050_gyro_enable(sensor, false);
 		if (ret) {
@@ -1110,8 +1151,7 @@ static int mpu6050_gyro_set_enable(struct mpu6050_sensor *sensor, bool enable)
 			goto exit;
 		}
 		if (sensor->use_poll)
-			cancel_delayed_work_sync(&sensor->gyro_poll_work);
-
+			hrtimer_cancel(&sensor->timer_gyro);
 	}
 
 exit:
@@ -1242,6 +1282,7 @@ static int mpu6050_gyro_set_poll_delay(struct mpu6050_sensor *sensor,
 					unsigned long delay)
 {
 	int ret;
+	ktime_t ktime;
 
 	mutex_lock(&sensor->op_lock);
 	if (delay < MPU6050_GYRO_MIN_POLL_INTERVAL_MS)
@@ -1251,9 +1292,11 @@ static int mpu6050_gyro_set_poll_delay(struct mpu6050_sensor *sensor,
 
 	sensor->gyro_poll_ms = delay;
 	if (sensor->use_poll) {
-		cancel_delayed_work_sync(&sensor->gyro_poll_work);
-		schedule_delayed_work(&sensor->gyro_poll_work,
-				msecs_to_jiffies(sensor->gyro_poll_ms));
+		hrtimer_cancel(&sensor->timer_gyro);
+		ktime = ktime_set(0,
+			sensor->gyro_poll_ms * NSEC_PER_MSEC);
+		hrtimer_start(&sensor->timer_gyro, ktime, HRTIMER_MODE_REL);
+
 	} else {
 		ret = mpu6050_config_sample_rate(sensor);
 		if (ret < 0)
@@ -1468,6 +1511,7 @@ static int mpu6050_accel_enable(struct mpu6050_sensor *sensor, bool on)
 static int mpu6050_accel_set_enable(struct mpu6050_sensor *sensor, bool enable)
 {
 	int ret = 0;
+	ktime_t ktime;
 
 	mutex_lock(&sensor->op_lock);
 	if (enable) {
@@ -1495,13 +1539,14 @@ static int mpu6050_accel_set_enable(struct mpu6050_sensor *sensor, bool enable)
 			goto exit;
 		}
 
-		if (sensor->use_poll)
-			schedule_delayed_work(&sensor->accel_poll_work,
-				msecs_to_jiffies(sensor->accel_poll_ms));
+		if (sensor->use_poll) {
+			ktime = ktime_set(0,
+					sensor->accel_poll_ms * NSEC_PER_MSEC);
+			hrtimer_start(&sensor->timer_acc, ktime, HRTIMER_MODE_REL);
+		}
 	} else {
 		if (sensor->use_poll)
-			cancel_delayed_work_sync(&sensor->accel_poll_work);
-
+			hrtimer_cancel(&sensor->timer_acc);
 		ret = mpu6050_accel_enable(sensor, false);
 		if (ret) {
 			dev_err(&sensor->client->dev,
@@ -1521,6 +1566,7 @@ static int mpu6050_accel_set_poll_delay(struct mpu6050_sensor *sensor,
 					unsigned long delay)
 {
 	int ret;
+	ktime_t ktime;
 
 	mutex_lock(&sensor->op_lock);
 	if (delay < MPU6050_ACCEL_MIN_POLL_INTERVAL_MS)
@@ -1531,9 +1577,10 @@ static int mpu6050_accel_set_poll_delay(struct mpu6050_sensor *sensor,
 	sensor->accel_poll_ms = delay;
 
 	if (sensor->use_poll) {
-		cancel_delayed_work_sync(&sensor->accel_poll_work);
-		schedule_delayed_work(&sensor->accel_poll_work,
-				msecs_to_jiffies(sensor->accel_poll_ms));
+		hrtimer_cancel(&sensor->timer_acc);
+		ktime = ktime_set(0,
+			sensor->accel_poll_ms * NSEC_PER_MSEC);
+		hrtimer_start(&sensor->timer_acc, ktime, HRTIMER_MODE_REL);
 	} else {
 		ret = mpu6050_config_sample_rate(sensor);
 		if (ret < 0)
@@ -2165,6 +2212,8 @@ static int mpu6050_probe(struct i2c_client *client,
 	sensor->accel_poll_ms = MPU6050_ACCEL_DEFAULT_POLL_INTERVAL_MS;
 	sensor->gyro_poll_ms = MPU6050_GYRO_DEFAULT_POLL_INTERVAL_MS;
 
+	input_set_events_per_packet(sensor->accel_dev, 100);
+	input_set_events_per_packet(sensor->gyro_dev, 100);
 	input_set_capability(sensor->accel_dev, EV_ABS, ABS_MISC);
 	input_set_capability(sensor->gyro_dev, EV_ABS, ABS_MISC);
 	input_set_abs_params(sensor->accel_dev, ABS_X,
@@ -2228,9 +2277,13 @@ static int mpu6050_probe(struct i2c_client *client,
 		disable_irq(client->irq);
 	} else {
 		sensor->use_poll = 1;
-		INIT_DELAYED_WORK(&sensor->accel_poll_work,
+		INIT_WORK(&sensor->accel_poll_work,
 			mpu6050_accel_work_fn);
-		INIT_DELAYED_WORK(&sensor->gyro_poll_work,
+		hrtimer_init(&sensor->timer_acc, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		sensor->timer_acc.function = mpu6050_acc_timer_handle;
+		hrtimer_init(&sensor->timer_gyro, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		sensor->timer_gyro.function = mpu6050_gyro_timer_handle;
+		INIT_WORK(&sensor->gyro_poll_work,
 			mpu6050_gyro_work_fn);
 		dev_dbg(&client->dev,
 			"Polling mode is enabled. use_int=%d gpio_int=%d",
@@ -2385,10 +2438,10 @@ static int mpu6050_suspend(struct device *dev)
 		disable_irq(client->irq);
 	} else {
 		if (sensor->cfg.gyro_enable)
-			cancel_delayed_work_sync(&sensor->gyro_poll_work);
+			hrtimer_cancel(&sensor->timer_gyro);
 
 		if (sensor->cfg.accel_enable)
-			cancel_delayed_work_sync(&sensor->accel_poll_work);
+			hrtimer_cancel(&sensor->timer_acc);
 	}
 
 	mpu6050_set_power_mode(sensor, false);
@@ -2416,6 +2469,7 @@ static int mpu6050_resume(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct mpu6050_sensor *sensor = i2c_get_clientdata(client);
 	int ret = 0;
+	ktime_t ktime;
 
 	if (sensor->cfg.mot_det_on) {
 		/* keep accel on and config motion detection wakeup */
@@ -2458,8 +2512,9 @@ static int mpu6050_resume(struct device *dev)
 		}
 
 		if (sensor->use_poll) {
-			schedule_delayed_work(&sensor->gyro_poll_work,
-				msecs_to_jiffies(sensor->gyro_poll_ms));
+			ktime = ktime_set(0,
+				sensor->gyro_poll_ms * NSEC_PER_MSEC);
+			hrtimer_start(&sensor->timer_gyro, ktime, HRTIMER_MODE_REL);
 		}
 	}
 
@@ -2471,8 +2526,9 @@ static int mpu6050_resume(struct device *dev)
 		}
 
 		if (sensor->use_poll) {
-			schedule_delayed_work(&sensor->accel_poll_work,
-				msecs_to_jiffies(sensor->accel_poll_ms));
+			ktime = ktime_set(0,
+				sensor->accel_poll_ms * NSEC_PER_MSEC);
+			hrtimer_start(&sensor->timer_acc, ktime, HRTIMER_MODE_REL);
 		}
 	}
 
