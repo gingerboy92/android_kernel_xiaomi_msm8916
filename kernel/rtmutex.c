@@ -861,6 +861,8 @@ static inline int rt_mutex_slowtrylock(struct rt_mutex *lock)
 static bool __sched rt_mutex_slowunlock(struct rt_mutex *lock,
 					struct wake_q_head *wake_q)
 {
+	WAKE_Q(wake_q);
+
 	raw_spin_lock(&lock->wait_lock);
 
 	debug_rt_mutex_unlock(lock);
@@ -912,9 +914,10 @@ static bool __sched rt_mutex_slowunlock(struct rt_mutex *lock,
 	 *
 	 * Queue the next waiter for wakeup once we release the wait_lock.
 	 */
-	mark_wakeup_next_waiter(wake_q, lock);
+	mark_wakeup_next_waiter(&wake_q, lock);
 
 	raw_spin_unlock(&lock->wait_lock);
+	wake_up_q(&wake_q);
 
 	/* check PI boosting */
 	return true;
