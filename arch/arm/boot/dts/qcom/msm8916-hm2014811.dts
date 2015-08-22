@@ -12,8 +12,9 @@
 
 /dts-v1/;
 
-#include "hm2014811/msm8916-hm2014811.dtsi"
+#include "msm8916-qrd.dtsi"
 #include "msm8916-memory.dtsi"
+#include "hm2014811/msm8916-hm2014811.dtsi"
 
 / {
 	model = "Qualcomm Technologies, Inc. MSM 8916 HM2014811";

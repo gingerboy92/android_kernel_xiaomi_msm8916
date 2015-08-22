@@ -10,8 +10,8 @@
  * GNU General Public License for more details.
  */
 
-#include "../msm8916-qrd.dtsi"
 #include "msm8916-camera-sensor-hm2014811.dtsi"
+#include "msm-pm8916-hm2014811.dtsi"
 #include "dsi-panel-r69431-720p-video.dtsi"
 #include "dsi-panel-nt35521s-720p-video.dtsi"
 #include "dsi-panel-nt35521-ofilm-720p-video.dtsi"
@@ -35,7 +35,7 @@
 
 	sound {
 		compatible = "qcom,msm8x16-audio-codec";
-		qcom,model = "msm8x16-skui-snd-card";
+		qcom,model = "msm8x16-hm2014811-snd-card";
 		qcom,msm-snd-card-id = <0>;
 		qcom,msm-ext-pa = "primary";
 		qcom,msm-codec-type = "internal";

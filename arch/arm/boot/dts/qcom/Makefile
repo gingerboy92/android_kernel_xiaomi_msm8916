@@ -28,7 +28,7 @@ dtb-$(CONFIG_ARCH_MSM8974) += msm8974-v1-cdp.dtb \
 	msm8974pro-ac-pm8941-liquid.dtb \
 	msm8974pro-ac-pm8941-mtp.dtb \
 	msm8974pro-ac-pma8084-pm8941-mtp.dtb
-ifeq ($(CONFIG_MACH_HM2014811),y)
+ifeq ($(CONFIG_MACH_XIAOMI_MSM8916),y)
 dtb-$(CONFIG_ARCH_MSM8916) += msm8916-hm2014811.dtb
 else
 dtb-$(CONFIG_ARCH_MSM8916) += msm8916-sim.dtb \
