@@ -17,8 +17,6 @@
 #include <asm/pgtable-hwdef.h>
 #include <asm/pgtable.h>
 
-	.arch	armv7-a
-
 #include "proc-macros.S"
 
 #ifdef CONFIG_ARM_LPAE
