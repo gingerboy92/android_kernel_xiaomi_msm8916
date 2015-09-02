@@ -263,7 +263,6 @@ static struct sensors_classdev ps_cdev = {
 	.min_delay = 10000,
 	.fifo_reserved_event_count = 0,
 	.fifo_max_event_count = 0,
-	.flags = 1,
 	.enabled = 0,
 	.delay_msec = 50,
 	.sensors_enable = NULL,
@@ -780,10 +779,6 @@ static int ltr553_process_data(struct ltr553_data *ltr, int als_ps)
 
 		if (lux != ltr->last_als) {
 			input_report_abs(ltr->input_light, ABS_MISC, lux);
-			input_event(ltr->input_light, EV_SYN, SYN_TIME_SEC,
-					ktime_to_timespec(timestamp).tv_sec);
-			input_event(ltr->input_light, EV_SYN, SYN_TIME_NSEC,
-					ktime_to_timespec(timestamp).tv_nsec);
 			input_sync(ltr->input_light);
 
 			ltr->last_als_ts = timestamp;
@@ -856,10 +851,6 @@ static int ltr553_process_data(struct ltr553_data *ltr, int als_ps)
 		if (distance != ltr->last_ps) {
 			input_report_abs(ltr->input_proximity, ABS_DISTANCE,
 					distance);
-			input_event(ltr->input_proximity, EV_SYN, SYN_TIME_SEC,
-					ktime_to_timespec(timestamp).tv_sec);
-			input_event(ltr->input_proximity, EV_SYN, SYN_TIME_NSEC,
-					ktime_to_timespec(timestamp).tv_nsec);
 			input_sync(ltr->input_proximity);
 
 			ltr->last_ps_ts = timestamp;
@@ -1382,231 +1373,6 @@ exit:
 	return 0;
 }
 
-static int ltr553_cdev_ps_flush(struct sensors_classdev *sensors_cdev)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-
-	input_event(ltr->input_proximity, EV_SYN, SYN_CONFIG,
-			ltr->flush_count++);
-	input_sync(ltr->input_proximity);
-
-	return 0;
-}
-
-static int ltr553_cdev_als_flush(struct sensors_classdev *sensors_cdev)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, als_cdev);
-
-	input_event(ltr->input_light, EV_SYN, SYN_CONFIG, ltr->flush_count++);
-	input_sync(ltr->input_light);
-
-	return 0;
-}
-
-/* This function should be called when sensor is disabled */
-static int ltr553_cdev_ps_calibrate(struct sensors_classdev *sensors_cdev,
-		int axis, int apply_now)
-{
-	int rc;
-	int power;
-	unsigned int config;
-	unsigned int interrupt;
-	unsigned int tmp;
-	u16 min = PS_DATA_MASK;
-	u8 ps_data[2];
-	int count = LTR553_CALIBRATE_SAMPLES;
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-
-
-	if (axis != AXIS_BIAS)
-		return 0;
-
-	mutex_lock(&ltr->ops_lock);
-
-	/* Ensure only be called when sensors in standy mode */
-	if (ltr->als_enabled || ltr->ps_enabled) {
-		rc = -EPERM;
-		goto exit;
-	}
-
-	power = ltr->power_enabled;
-	if (!power) {
-		rc = sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), true);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-	}
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_INTERRUPT, &interrupt);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read interrupt configuration failed\n");
-		goto exit_power_off;
-	}
-
-	/* disable interrupt */
-	rc = regmap_write(ltr->regmap, LTR553_REG_INTERRUPT, 0x0);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "disable interrupt failed\n");
-		goto exit_power_off;
-	}
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_PS_CTL, &config);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit_enable_interrupt;
-	}
-
-	/* clear offset */
-	ps_data[0] = 0;
-	ps_data[1] = 0;
-	rc = regmap_bulk_write(ltr->regmap, LTR553_REG_PS_OFFSET_1,
-			ps_data, 2);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_OFFSET_1, rc);
-		goto exit_enable_interrupt;
-	}
-
-	/* enable ps sensor */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL, config | 0x02);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit_enable_interrupt;
-	}
-
-	/* ps measurement rate */
-	rc = regmap_read(ltr->regmap, LTR553_REG_PS_MEAS_RATE, &tmp);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_MEAS_RATE, rc);
-		goto exit_enable_interrupt;
-	}
-
-	msleep(LTR553_WAKE_TIME_MS);
-
-	while (--count) {
-		/* wait for data ready */
-		msleep(ps_mrr_table[tmp & 0xf]);
-		rc = regmap_bulk_read(ltr->regmap, LTR553_REG_PS_DATA_0,
-				ps_data, 2);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read PS data failed\n");
-			break;
-		}
-		if (min > ((ps_data[1] << 8) | ps_data[0]))
-			min = (ps_data[1] << 8) | ps_data[0];
-	}
-
-	/* disable ps sensor */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL, config);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit_enable_interrupt;
-	}
-
-	if (!count) {
-		if (min > (PS_DATA_MASK >> 1)) {
-			dev_err(&ltr->i2c->dev, "ps data out of range, check if shield\n");
-			rc = -EINVAL;
-			goto exit_enable_interrupt;
-		}
-
-		if (apply_now) {
-			ps_data[1] = PS_LOW_BYTE(min);
-			ps_data[0] = PS_HIGH_BYTE(min);
-			rc = regmap_bulk_write(ltr->regmap,
-					LTR553_REG_PS_OFFSET_1, ps_data, 2);
-			if (rc) {
-				dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-						LTR553_REG_PS_OFFSET_1, rc);
-				goto exit_enable_interrupt;
-			}
-			ltr->bias = min;
-		}
-
-		snprintf(ltr->calibrate_buf, sizeof(ltr->calibrate_buf),
-				"0,0,%d", min);
-		dev_dbg(&ltr->i2c->dev, "result: %s\n", ltr->calibrate_buf);
-	} else {
-		dev_err(&ltr->i2c->dev, "calibration failed\n");
-		rc = -EINVAL;
-	}
-
-exit_enable_interrupt:
-	if (regmap_write(ltr->regmap, LTR553_REG_INTERRUPT, interrupt)) {
-		dev_err(&ltr->i2c->dev, "enable interrupt failed\n");
-		goto exit_power_off;
-	}
-
-exit_power_off:
-	if (!power) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power off sensor failed.\n");
-			goto exit;
-		}
-	}
-exit:
-	mutex_unlock(&ltr->ops_lock);
-	return rc;
-}
-
-static int ltr553_cdev_ps_write_cal(struct sensors_classdev *sensors_cdev,
-		struct cal_result_t *cal_result)
-{
-	int power;
-	u8 ps_data[2];
-	int rc = 0;
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-
-	mutex_lock(&ltr->ops_lock);
-	power = ltr->power_enabled;
-	if (!power) {
-		rc = sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), true);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-	}
-
-	ltr->bias = cal_result->bias;
-	ps_data[1] = PS_LOW_BYTE(cal_result->bias);
-	ps_data[0] = PS_HIGH_BYTE(cal_result->bias);
-	rc = regmap_bulk_write(ltr->regmap, LTR553_REG_PS_OFFSET_1,
-			ps_data, 2);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_OFFSET_1, rc);
-		goto exit_power_off;
-	}
-
-	snprintf(ltr->calibrate_buf, sizeof(ltr->calibrate_buf), "0,0,%d",
-			ltr->bias);
-
-exit_power_off:
-	if (!power) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power off sensor failed.\n");
-			goto exit;
-		}
-	}
-exit:
-
-	mutex_unlock(&ltr->ops_lock);
-	return rc;
-};
-
 static ssize_t ltr553_register_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -1829,7 +1595,6 @@ static int ltr553_probe(struct i2c_client *client,
 	ltr->als_cdev = als_cdev;
 	ltr->als_cdev.sensors_enable = ltr553_cdev_enable_als;
 	ltr->als_cdev.sensors_poll_delay = ltr553_cdev_set_als_delay;
-	ltr->als_cdev.sensors_flush = ltr553_cdev_als_flush;
 	res = sensors_classdev_register(&client->dev, &ltr->als_cdev);
 	if (res) {
 		dev_err(&client->dev, "sensors class register failed.\n");
@@ -1839,10 +1604,6 @@ static int ltr553_probe(struct i2c_client *client,
 	ltr->ps_cdev = ps_cdev;
 	ltr->ps_cdev.sensors_enable = ltr553_cdev_enable_ps;
 	ltr->ps_cdev.sensors_poll_delay = ltr553_cdev_set_ps_delay;
-	ltr->ps_cdev.sensors_flush = ltr553_cdev_ps_flush;
-	ltr->ps_cdev.sensors_calibrate = ltr553_cdev_ps_calibrate;
-	ltr->ps_cdev.sensors_write_cal_params = ltr553_cdev_ps_write_cal;
-	ltr->ps_cdev.params = ltr->calibrate_buf;
 	res = sensors_classdev_register(&client->dev, &ltr->ps_cdev);
 	if (res) {
 		dev_err(&client->dev, "sensors class register failed.\n");
