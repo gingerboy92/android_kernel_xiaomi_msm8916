@@ -76,7 +76,7 @@
 #define BMA2X2_MAX_DELAY            200
 #define BMA2X2_RANGE_SET            3 /* +/- 2G */
 #define BMA2X2_RANGE_SHIFT          4 /* shift 4 bits for 2G */
-#define BMA2X2_BW_SET               12 /* 125HZ  */
+#define BMA2X2_BW_SET               13 /* 250HZ  */
 
 #define I2C_RETRY_DELAY()           usleep_range(1000, 2000)
 /* wait 2ms for calibration ready */
@@ -1469,6 +1469,7 @@ struct bma2x2_data {
 	struct mutex value_mutex;
 	struct mutex enable_mutex;
 	struct mutex mode_mutex;
+	struct workqueue_struct *data_wq;
 	struct delayed_work work;
 	struct work_struct irq_work;
 	struct regulator *vdd;
@@ -4837,6 +4838,30 @@ static int bma2x2_read_accel_xyz(struct i2c_client *client,
 	return comres;
 }
 
+static void bma2x2_report_axis_data(struct bma2x2_data *bma2x2)
+{
+	struct bma2x2acc acc;
+	ktime_t ts;
+	int err;
+
+	ts = ktime_get_boottime();
+	err = bma2x2_read_accel_xyz(bma2x2->bma2x2_client,
+			bma2x2->sensor_type, &acc);
+	if (err < 0) {
+		dev_err(&bma2x2->bma2x2_client->dev,
+			"read accel data failed! err = %d\n", err);
+		return;
+	}
+	input_report_abs(bma2x2->input, ABS_X, acc.x);
+	input_report_abs(bma2x2->input, ABS_Y, acc.y);
+	input_report_abs(bma2x2->input, ABS_Z, acc.z);
+	input_event(bma2x2->input, EV_SYN, SYN_TIME_SEC,
+			ktime_to_timespec(ts).tv_sec);
+	input_event(bma2x2->input, EV_SYN, SYN_TIME_NSEC,
+			ktime_to_timespec(ts).tv_nsec);
+	input_sync(bma2x2->input);
+}
+
 #ifndef CONFIG_BMA_ENABLE_NEWDATA_INT
 static void bma2x2_work_func(struct work_struct *work)
 {
@@ -4845,15 +4870,11 @@ static void bma2x2_work_func(struct work_struct *work)
 	static struct bma2x2acc acc;
 	unsigned long delay = msecs_to_jiffies(atomic_read(&bma2x2->delay));
 
-	bma2x2_read_accel_xyz(bma2x2->bma2x2_client, bma2x2->sensor_type, &acc);
-	input_report_abs(bma2x2->input, ABS_X, acc.x);
-	input_report_abs(bma2x2->input, ABS_Y, acc.y);
-	input_report_abs(bma2x2->input, ABS_Z, acc.z);
-	input_sync(bma2x2->input);
+	bma2x2_report_axis_data(bma2x2);
 	mutex_lock(&bma2x2->value_mutex);
 	bma2x2->value = acc;
 	mutex_unlock(&bma2x2->value_mutex);
-	schedule_delayed_work(&bma2x2->work, delay);
+	queue_delayed_work(bma2x2->data_wq, &bma2x2->work, delay);
 }
 #endif
 
@@ -5069,6 +5090,8 @@ static ssize_t bma2x2_delay_store(struct device *dev,
 	error = kstrtoul(buf, 10, &data);
 	if (error)
 		return error;
+	if (data < POLL_INTERVAL_MIN_MS)
+		data = POLL_INTERVAL_MIN_MS;
 	if (data > BMA2X2_MAX_DELAY)
 		data = BMA2X2_MAX_DELAY;
 	atomic_set(&bma2x2->delay, (unsigned int) data);
@@ -5107,7 +5130,8 @@ static void bma2x2_set_enable(struct device *dev, int enable)
 			bma2x2_set_mode(bma2x2->bma2x2_client,
 					BMA2X2_MODE_NORMAL);
 #ifndef CONFIG_BMA_ENABLE_NEWDATA_INT
-			schedule_delayed_work(&bma2x2->work,
+			queue_delayed_work(bma2x2->data_wq,
+				&bma2x2->work,
 				msecs_to_jiffies(atomic_read(&bma2x2->delay)));
 #endif
 			atomic_set(&bma2x2->enable, 1);
@@ -6609,12 +6633,7 @@ static void bma2x2_irq_work_func(struct work_struct *work)
 	bma2x2_get_interruptstatus2(bma2x2->bma2x2_client, &status);
 
 	if ((status&0x80) == 0x80) {
-		bma2x2_read_accel_xyz(bma2x2->bma2x2_client,
-					bma2x2->sensor_type, &acc);
-		input_report_abs(bma2x2->input, ABS_X, acc.x);
-		input_report_abs(bma2x2->input, ABS_Y, acc.y);
-		input_report_abs(bma2x2->input, ABS_Z, acc.z);
-		input_sync(bma2x2->input);
+		bma2x2_report_axis_data(bma2x2);
 		mutex_lock(&bma2x2->value_mutex);
 		bma2x2->value = acc;
 		mutex_unlock(&bma2x2->value_mutex);
@@ -7162,23 +7181,29 @@ static int bma2x2_probe(struct i2c_client *client,
 #ifndef CONFIG_BMA_ENABLE_NEWDATA_INT
 	INIT_DELAYED_WORK(&data->work, bma2x2_work_func);
 #endif
+	data->data_wq = create_freezable_workqueue("bma2x2_data_work");
+	if (!data->data_wq) {
+		dev_err(&client->dev, "Cannot get create workqueue!\n");
+		goto free_irq_exit;
+	}
+
 	atomic_set(&data->delay, BMA2X2_MAX_DELAY);
 	atomic_set(&data->enable, 0);
 
-	dev = input_allocate_device();
+	dev = devm_input_allocate_device(&client->dev);
 	if (!dev) {
 		dev_err(&client->dev,
 			"Cannot allocate input device\n");
 		err = -ENOMEM;
-		goto free_irq_exit;
+		goto destroy_workqueue_exit;
 	}
 
-	dev_interrupt = input_allocate_device();
+	dev_interrupt = devm_input_allocate_device(&client->dev);
 	if (!dev_interrupt) {
 		dev_err(&client->dev,
 			"Cannot allocate input interrupt device\n");
 		err = -ENOMEM;
-		goto free_input_dev_exit;
+		goto destroy_workqueue_exit;
 	}
 
 	/* only value events reported */
@@ -7194,7 +7219,7 @@ static int bma2x2_probe(struct i2c_client *client,
 	if (err < 0) {
 		dev_err(&client->dev,
 			"Cannot register input device\n");
-		goto free_input_interrupt_dev_exit;
+		goto free_irq_exit;
 	}
 
 	/* all interrupt generated events are moved to interrupt input devices*/
@@ -7222,7 +7247,7 @@ static int bma2x2_probe(struct i2c_client *client,
 	if (err < 0) {
 		dev_err(&client->dev,
 			"Cannot register input interrupt device\n");
-		goto unregister_input_dev_exit;
+		goto free_irq_exit;
 	}
 
 	data->dev_interrupt = dev_interrupt;
@@ -7234,7 +7259,7 @@ static int bma2x2_probe(struct i2c_client *client,
 		err = PTR_ERR(data->g_sensor_class);
 		data->g_sensor_class = NULL;
 		dev_err(&client->dev, "could not allocate g_sensor_class\n");
-		goto unregister_input_interrupt_dev_exit;
+		goto free_irq_exit;
 	}
 
 	data->g_sensor_dev = device_create(data->g_sensor_class,
@@ -7400,16 +7425,8 @@ destroy_g_sensor_class_exit:
 	class_destroy(data->g_sensor_class);
 #endif
 
-#if defined(CONFIG_SIG_MOTION) || defined(CONFIG_DOUBLE_TAP)
-unregister_input_interrupt_dev_exit:
-#endif
-	input_unregister_device(dev_interrupt);
-unregister_input_dev_exit:
-	input_unregister_device(dev);
-free_input_interrupt_dev_exit:
-	input_free_device(dev_interrupt);
-free_input_dev_exit:
-	input_free_device(dev);
+destroy_workqueue_exit:
+	destroy_workqueue(data->data_wq);
 free_irq_exit:
 disable_power_exit:
 	bma2x2_power_ctl(data, false);
@@ -7452,7 +7469,8 @@ static void bma2x2_late_resume(struct early_suspend *h)
 	if (atomic_read(&data->enable) == 1) {
 		bma2x2_set_mode(data->bma2x2_client, BMA2X2_MODE_NORMAL);
 #ifndef CONFIG_BMA_ENABLE_NEWDATA_INT
-		schedule_delayed_work(&data->work,
+		queue_delayed_work(data->data_wq,
+				&data->work,
 				msecs_to_jiffies(atomic_read(&data->delay)));
 #endif
 	}
@@ -7478,18 +7496,11 @@ static int bma2x2_remove(struct i2c_client *client)
 
 	bma2x2_sig_motion_disable(data);
 
-	if (data->dev_interrupt) {
-		input_unregister_device(data->dev_interrupt);
-		input_free_device(data->dev_interrupt);
-	}
-
-	if (data->input) {
+	if (data->input)
 		sysfs_remove_group(&data->input->dev.kobj,
 				&bma2x2_attribute_group);
-		input_unregister_device(data->input);
-		input_free_device(data->input);
-	}
 
+	destroy_workqueue(data->data_wq);
 	bma2x2_set_enable(&client->dev, 0);
 	bma2x2_power_deinit(data);
 	i2c_set_clientdata(client, NULL);

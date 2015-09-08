@@ -1,6 +1,6 @@
 /******************** (C) COPYRIGHT 2010 STMicroelectronics ********************
  *
- * Copyright (c) 2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * File Name          : lis3dh_acc.c
  * Authors            : MSH - Motion Mems BU - Application Team
@@ -266,6 +266,7 @@ struct lis3dh_acc_data {
 	struct pinctrl_state *pin_sleep;
 
 	struct mutex lock;
+	struct workqueue_struct *data_wq;
 	struct delayed_work input_work;
 
 	struct input_dev *input_dev;
@@ -334,7 +335,7 @@ static inline s64 lis3dh_acc_get_time_ns(void)
 {
 	struct timespec ts;
 
-	ktime_get_ts(&ts);
+	get_monotonic_boottime(&ts);
 	return timespec_to_ns(&ts);
 }
 
@@ -1110,9 +1111,18 @@ static int lis3dh_acc_get_acceleration_data(struct lis3dh_acc_data *acc,
 static void lis3dh_acc_report_values(struct lis3dh_acc_data *acc,
 					int *xyz)
 {
+	ktime_t timestamp;
+
+	timestamp = ktime_get_boottime();
 	input_report_abs(acc->input_dev, ABS_X, xyz[0]);
 	input_report_abs(acc->input_dev, ABS_Y, xyz[1]);
 	input_report_abs(acc->input_dev, ABS_Z, xyz[2]);
+	input_event(acc->input_dev,
+		EV_SYN, SYN_TIME_SEC,
+		ktime_to_timespec(timestamp).tv_sec);
+	input_event(acc->input_dev,
+		EV_SYN, SYN_TIME_NSEC,
+		ktime_to_timespec(timestamp).tv_nsec);
 	input_sync(acc->input_dev);
 }
 
@@ -1139,7 +1149,7 @@ static int lis3dh_acc_enable(struct lis3dh_acc_data *acc)
 			return err;
 		}
 		if (!acc->pdata->enable_int && !acc->use_batch) {
-			schedule_delayed_work(&acc->input_work,
+			queue_delayed_work(acc->data_wq, &acc->input_work,
 				msecs_to_jiffies(acc->delay_ms));
 			return 0;
 		}
@@ -1629,11 +1639,11 @@ static int lis3dh_acc_flush(struct sensors_classdev *sensors_cdev)
 {
 	struct lis3dh_acc_data *acc = container_of(sensors_cdev,
 			struct lis3dh_acc_data, cdev);
-	s64 timestamp;
+	s64 timestamp, sec, ns;
 	int err;
 	int fifo_cnt;
 	int i;
-	u32 time_h, time_l, time_ms;
+	u32 time_ms;
 	int xyz[3] = {0};
 
 	timestamp = lis3dh_acc_get_time_ns();
@@ -1654,14 +1664,14 @@ static int lis3dh_acc_flush(struct sensors_classdev *sensors_cdev)
 		} else {
 			timestamp = timestamp +
 				(time_ms * LIS3DH_TIME_MS_TO_NS);
-			time_h = (u32)(((u64)timestamp >> 32) & 0xFFFFFFFF);
-			time_l = (u32)(timestamp & 0xFFFFFFFF);
-
-			input_report_abs(acc->input_dev, ABS_RX,
-					time_h);
-			input_report_abs(acc->input_dev, ABS_RY,
-					time_l);
-			lis3dh_acc_report_values(acc, xyz);
+			sec = timestamp;
+			ns = do_div(sec, NSEC_PER_SEC);
+			input_event(acc->input_dev, EV_SYN, SYN_TIME_SEC, sec);
+			input_event(acc->input_dev, EV_SYN, SYN_TIME_NSEC, ns);
+			input_report_abs(acc->input_dev, ABS_X, xyz[0]);
+			input_report_abs(acc->input_dev, ABS_Y, xyz[1]);
+			input_report_abs(acc->input_dev, ABS_Z, xyz[2]);
+			input_sync(acc->input_dev);
 		}
 	}
 
@@ -1772,8 +1782,8 @@ static void lis3dh_acc_input_work_func(struct work_struct *work)
 	else
 		lis3dh_acc_report_values(acc, xyz);
 
-	schedule_delayed_work(&acc->input_work, msecs_to_jiffies(
-			acc->delay_ms));
+	queue_delayed_work(acc->data_wq, &acc->input_work,
+		msecs_to_jiffies(acc->delay_ms));
 	mutex_unlock(&acc->lock);
 }
 
@@ -1829,9 +1839,7 @@ static int lis3dh_acc_input_init(struct lis3dh_acc_data *acc)
 {
 	int err;
 
-	if (!acc->pdata->enable_int)
-		INIT_DELAYED_WORK(&acc->input_work, lis3dh_acc_input_work_func);
-	acc->input_dev = input_allocate_device();
+	acc->input_dev = devm_input_allocate_device(&acc->client->dev);
 	if (!acc->input_dev) {
 		err = -ENOMEM;
 		dev_err(&acc->client->dev, "input device allocation failed\n");
@@ -1870,21 +1878,13 @@ static int lis3dh_acc_input_init(struct lis3dh_acc_data *acc)
 		dev_err(&acc->client->dev,
 				"unable to register input device %s\n",
 				acc->input_dev->name);
-		goto err1;
+		goto err0;
 	}
 
 	return 0;
 
-err1:
-	input_free_device(acc->input_dev);
 err0:
 	return err;
-}
-
-static void lis3dh_acc_input_cleanup(struct lis3dh_acc_data *acc)
-{
-	input_unregister_device(acc->input_dev);
-	input_free_device(acc->input_dev);
 }
 
 static int lis3dh_pinctrl_init(struct lis3dh_acc_data *acc)
@@ -2162,12 +2162,22 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 		goto err_power_off;
 	}
 
+	acc->data_wq = NULL;
+	if (!acc->pdata->enable_int) {
+		acc->data_wq = create_freezable_workqueue("lis3dh_data_work");
+		if (!acc->data_wq) {
+			dev_err(&client->dev, "create workquque failed\n");
+			goto err_power_off;
+		}
+		INIT_DELAYED_WORK(&acc->input_work,
+			lis3dh_acc_input_work_func);
+	}
 
 	err = create_sysfs_interfaces(&client->dev);
 	if (err < 0) {
 		dev_err(&client->dev,
 		   "device LIS3DH_ACC_DEV_NAME sysfs register failed\n");
-		goto err_input_cleanup;
+		goto err_destroy_workqueue;
 	}
 
 	acc->cdev = lis3dh_acc_cdev;
@@ -2239,8 +2249,9 @@ err_unreg_sensor_class:
 	sensors_classdev_unregister(&acc->cdev);
 err_remove_sysfs_int:
 	remove_sysfs_interfaces(&client->dev);
-err_input_cleanup:
-	lis3dh_acc_input_cleanup(acc);
+err_destroy_workqueue:
+	if (acc->data_wq)
+		destroy_workqueue(acc->data_wq);
 err_power_off:
 	lis3dh_acc_device_power_off(acc);
 err_regulator_init:
@@ -2270,9 +2281,10 @@ static int lis3dh_acc_remove(struct i2c_client *client)
 		free_irq(acc->irq2, acc);
 
 	sensors_classdev_unregister(&acc->cdev);
-	lis3dh_acc_input_cleanup(acc);
 	lis3dh_acc_config_regulator(acc, false);
 	remove_sysfs_interfaces(&client->dev);
+	if (acc->data_wq)
+		destroy_workqueue(acc->data_wq);
 
 	if (acc->pdata->exit)
 		acc->pdata->exit();
