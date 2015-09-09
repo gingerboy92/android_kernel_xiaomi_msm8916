@@ -623,6 +623,9 @@ endif
 # Fix build for GCC 4.7
 EXTRA_CFLAGS += -Wno-maybe-uninitialized -Wno-unused-function
 
+#Fix build for GCC 5.2
+EXTRA_CFLAGS += -Wno-discarded-array-qualifiers
+
 KBUILD_CPPFLAGS += $(CDEFINES)
 
 # Module information used by KBuild framework
